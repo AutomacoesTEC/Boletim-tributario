@@ -17,6 +17,16 @@ SENDER_EMAIL = SMTP_USER
 UNSUBSCRIBE_EMAIL = SMTP_USER
 
 # ═══════════════════════════════════════════════════════════
+# GITHUB PAGES (site do boletim)
+# Ajuste a URL abaixo para o seu repositório
+# Formato: https://<usuario>.github.io/<repositorio>/
+# ═══════════════════════════════════════════════════════════
+GITHUB_PAGES_URL = os.environ.get(
+    "PAGES_URL",
+    "https://naytributario.github.io/Boletim-tribut-rio/"
+)
+
+# ═══════════════════════════════════════════════════════════
 # SEÇÕES REGULARES (data = HOJE)
 # Chave = param "secao" para /leiturajornal
 # ═══════════════════════════════════════════════════════════
