@@ -107,6 +107,7 @@ class PageBuilder:
                     <span class="secao-chevron">▸</span>
                     <h2 class="secao-titulo">{_esc(nome)}</h2>
                     <span class="secao-badge">{total_secao}</span>
+                    <span class="secao-hint">clique para expandir</span>
                 </div>
             </div>
             <div class="secao-conteudo collapsed">
@@ -118,11 +119,12 @@ class PageBuilder:
         pubs_html = "\n".join(self._build_pub(p) for p in pubs)
         return f"""
         <div class="orgao" data-orgao="{_esc(nome)}">
-            <div class="orgao-header">
+            <div class="orgao-header" onclick="toggleOrgao(this)" role="button" tabindex="0">
+                <span class="orgao-chevron">▸</span>
                 <span class="orgao-nome">{_esc(nome)}</span>
                 <span class="orgao-count">{len(pubs)}</span>
             </div>
-            <div class="orgao-pubs">
+            <div class="orgao-pubs orgao-collapsed">
                 {pubs_html}
             </div>
         </div>"""
@@ -403,6 +405,16 @@ body {{
   border-radius: 12px;
   flex-shrink: 0;
 }}
+.secao-hint {{
+  font-size: 10px;
+  color: var(--gray-400);
+  font-style: italic;
+  margin-left: 8px;
+  transition: opacity 0.2s;
+}}
+.secao.open .secao-hint {{
+  opacity: 0;
+}}
 .secao-conteudo {{
   max-height: 0;
   overflow: hidden;
@@ -412,7 +424,7 @@ body {{
   max-height: 0;
 }}
 
-/* ═══ ÓRGÃO ═══ */
+/* ═══ ÓRGÃO (colapsável) ═══ */
 .orgao {{
   padding: 0 20px;
 }}
@@ -421,6 +433,25 @@ body {{
   align-items: center;
   padding: 10px 0 6px;
   border-bottom: 1px solid var(--gray-200);
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.15s;
+  border-radius: 4px;
+  padding: 8px 6px;
+  margin: 0 -6px;
+}}
+.orgao-header:hover {{
+  background: var(--gray-50);
+}}
+.orgao-chevron {{
+  font-size: 11px;
+  color: var(--gray-400);
+  transition: transform 0.25s;
+  flex-shrink: 0;
+  margin-right: 8px;
+}}
+.orgao.open .orgao-chevron {{
+  transform: rotate(90deg);
 }}
 .orgao-nome {{
   font-family: var(--font-serif);
@@ -432,6 +463,18 @@ body {{
 .orgao-count {{
   font-size: 11px;
   color: var(--gray-400);
+  background: var(--gray-100);
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-weight: 600;
+}}
+.orgao-pubs {{
+  max-height: 0;
+  overflow: hidden;
+  transition: max-height 0.3s ease;
+}}
+.orgao-pubs.orgao-collapsed {{
+  max-height: 0;
 }}
 
 /* ═══ PUBLICAÇÃO ═══ */
@@ -582,10 +625,29 @@ function toggleSecao(header) {{
   }}
 }}
 
-// Expandir todas ao carregar
-document.addEventListener('DOMContentLoaded', () => {{
-  document.querySelectorAll('.secao-header').forEach(h => toggleSecao(h));
-}});
+// ═══ COLAPSAR/EXPANDIR ÓRGÃOS ═══
+function toggleOrgao(header) {{
+  const orgao = header.closest('.orgao');
+  const pubs = orgao.querySelector('.orgao-pubs');
+  const isOpen = orgao.classList.contains('open');
+
+  if (isOpen) {{
+    pubs.style.maxHeight = '0';
+    orgao.classList.remove('open');
+  }} else {{
+    pubs.style.maxHeight = pubs.scrollHeight + 'px';
+    orgao.classList.add('open');
+    // Recalcular max-height da seção pai (que agora tem mais conteúdo)
+    const secaoConteudo = orgao.closest('.secao-conteudo');
+    if (secaoConteudo) {{
+      setTimeout(() => {{
+        secaoConteudo.style.maxHeight = secaoConteudo.scrollHeight + 'px';
+      }}, 50);
+    }}
+  }}
+}}
+
+// Seções começam FECHADAS — usuário clica para expandir
 
 // ═══ BUSCA EM TEMPO REAL ═══
 const searchInput = document.getElementById('searchInput');
@@ -600,9 +662,14 @@ searchInput.addEventListener('input', function() {{
   }});
 
   if (query.length < 3) {{
-    // Mostrar tudo
+    // Mostrar tudo, colapsar órgãos de volta
     document.querySelectorAll('.pub').forEach(p => p.classList.remove('hidden'));
-    document.querySelectorAll('.orgao').forEach(o => o.style.display = '');
+    document.querySelectorAll('.orgao').forEach(o => {{
+      o.style.display = '';
+      o.classList.remove('open');
+      const pubs = o.querySelector('.orgao-pubs');
+      if (pubs) pubs.style.maxHeight = '0';
+    }});
     document.querySelectorAll('.secao').forEach(s => s.style.display = '');
     searchInfo.classList.remove('visible');
     // Recalcular max-height das seções abertas
@@ -627,13 +694,23 @@ searchInput.addEventListener('input', function() {{
     }}
   }});
 
-  // Esconder órgãos sem publicações visíveis
+  // Esconder órgãos sem publicações visíveis, expandir os com resultados
   document.querySelectorAll('.orgao').forEach(orgao => {{
     const visiblePubs = orgao.querySelectorAll('.pub:not(.hidden)');
-    orgao.style.display = visiblePubs.length === 0 ? 'none' : '';
+    if (visiblePubs.length === 0) {{
+      orgao.style.display = 'none';
+    }} else {{
+      orgao.style.display = '';
+      // Expandir órgão se tem resultados
+      if (!orgao.classList.contains('open')) {{
+        orgao.classList.add('open');
+        const pubs = orgao.querySelector('.orgao-pubs');
+        if (pubs) pubs.style.maxHeight = pubs.scrollHeight + 'px';
+      }}
+    }}
   }});
 
-  // Esconder seções sem órgãos visíveis
+  // Esconder seções sem órgãos visíveis, expandir as com resultados
   document.querySelectorAll('.secao').forEach(secao => {{
     const visibleOrgaos = secao.querySelectorAll('.orgao:not([style*="display: none"])');
     secao.style.display = visibleOrgaos.length === 0 ? 'none' : '';
@@ -644,7 +721,7 @@ searchInput.addEventListener('input', function() {{
     // Atualizar max-height
     const conteudo = secao.querySelector('.secao-conteudo');
     if (conteudo && secao.classList.contains('open')) {{
-      conteudo.style.maxHeight = conteudo.scrollHeight + 'px';
+      setTimeout(() => {{ conteudo.style.maxHeight = conteudo.scrollHeight + 'px'; }}, 60);
     }}
   }});
 
