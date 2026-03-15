@@ -1,20 +1,19 @@
 """
 dou_fetcher.py — Coleta de publicações do Diário Oficial da União
 
-ESTRATÉGIA DUPLA para não perder nenhuma publicação:
+ESTRATÉGIA DUPLA:
+  1ª: /leiturajornal (JSON completo da seção) → filtra localmente
+  2ª: /consulta/-/buscar/dou (busca paginada por órgão) → fallback
 
-  1ª (primária): /leiturajornal?secao=dou1&data=DD-MM-YYYY
-     → retorna TODAS as publicações da seção/data num JSON embutido
-     → filtra localmente pelos órgãos desejados
-     → garante completude total
+CAMADA 1 — RETRY AGRESSIVO:
+  Cada seção regular é tentada até SECTION_RETRIES vezes.
+  Se /leiturajornal falha, cai para busca paginada.
+  Na última tentativa, força o fallback direto.
 
-  2ª (fallback): /consulta/-/buscar/dou?s=do1&exactDate=DD-MM-YYYY&orgPrin=...
-     → busca paginada por órgão
-     → usada se a primária falhar
-
-REGRAS DE DATA:
-  • Edições regulares (Seção 1, 2, 3): data = HOJE
-  • Edições extras (A, B, C...): data = DIA ÚTIL ANTERIOR
+CAMADA 2 — VALIDAÇÃO DE CONTAGEM:
+  O jsonArray retorna TODAS as publicações (não só dos nossos 6 órgãos).
+  Se o total bruto de uma seção regular é 0 num dia útil, é bug da API,
+  não ausência real. O retry é forçado.
 """
 
 import json
@@ -30,6 +29,9 @@ from bs4 import BeautifulSoup
 import config
 
 logger = logging.getLogger(__name__)
+
+SECTION_RETRIES = 5
+SECTION_RETRY_DELAY = 3.0
 
 
 # ─────────────────────────────────────────────────────────────
@@ -54,8 +56,6 @@ def hoje_eh_dia_de_envio() -> bool:
 # ─────────────────────────────────────────────────────────────
 
 class DOUFetcher:
-    """Coleta publicações do DOU via Imprensa Nacional."""
-
     HEADERS = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                        "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -73,97 +73,114 @@ class DOUFetcher:
     def buscar_publicacoes_do_dia(
         self, data_regular: date, data_extra: Optional[date] = None
     ) -> dict:
-        """
-        Busca todas as publicações relevantes.
-
-        Retorna:
-        {
-            "data_regular": "13/03/2026",
-            "data_extra": "12/03/2026" | None,
-            "secoes": {
-                "Seção 1": {
-                    "Ministério da Fazenda": [ {pub}, {pub}, ... ],
-                    ...
-                },
-                ...
-            },
-            "total_publicacoes": int,
-        }
-        """
         resultado = {
             "data_regular": data_regular.strftime("%d/%m/%Y"),
             "data_extra": data_extra.strftime("%d/%m/%Y") if data_extra else None,
             "secoes": {},
             "total_publicacoes": 0,
+            "completo": True,
+            "secoes_faltantes": [],
         }
 
-        # ── 1) EDIÇÕES REGULARES (Seção 1, 2, 3 — data de HOJE) ──
+        # Edições regulares (Seção 1, 2, 3 — data de HOJE)
         for secao_id, nome_secao in config.SECOES_REGULARES.items():
             logger.info(f"▶ {nome_secao} — {data_regular.strftime('%d/%m/%Y')}")
-            orgaos = self._buscar_secao(secao_id, data_regular)
+            orgaos = self._buscar_secao_com_retry(
+                secao_id, data_regular, nome_secao, eh_regular=True
+            )
             if orgaos:
                 resultado["secoes"][nome_secao] = orgaos
                 n = sum(len(v) for v in orgaos.values())
                 resultado["total_publicacoes"] += n
                 logger.info(f"  ✓ {n} publicação(ões) relevante(s)")
             else:
-                logger.info(f"  ○ Nenhuma publicação relevante")
+                logger.warning(f"  ⚠ {nome_secao} retornou VAZIO após todas as tentativas")
+                resultado["completo"] = False
+                resultado["secoes_faltantes"].append(nome_secao)
 
-        # ── 2) EDIÇÕES EXTRAS (data do DIA ÚTIL ANTERIOR) ──
+        # Edições extras (data do DIA ÚTIL ANTERIOR)
         if data_extra:
             for base_id, base_nome in config.SECOES_REGULARES.items():
                 for sufixo in config.EXTRA_SUFIXOS:
                     secao_extra_id = f"{base_id}{sufixo}"
                     nome_extra = config.nome_extra(base_nome, sufixo)
-                    logger.info(
-                        f"▶ {nome_extra} — {data_extra.strftime('%d/%m/%Y')} "
-                        f"(verificando...)"
+                    logger.info(f"▶ {nome_extra} — {data_extra.strftime('%d/%m/%Y')} (verificando...)")
+                    orgaos = self._buscar_secao_com_retry(
+                        secao_extra_id, data_extra, nome_extra, eh_regular=False
                     )
-                    orgaos = self._buscar_secao(secao_extra_id, data_extra)
                     if orgaos:
                         resultado["secoes"][nome_extra] = orgaos
                         n = sum(len(v) for v in orgaos.values())
                         resultado["total_publicacoes"] += n
                         logger.info(f"  ✓ {n} publicação(ões) em edição extra!")
-                    # Se não encontrou, silencia (é esperado que extras não existam)
 
+        self._log_completude(resultado)
         return resultado
+
+    # ─── RETRY AGRESSIVO POR SEÇÃO ────────────────────────
+
+    def _buscar_secao_com_retry(self, secao_id, data, nome_secao, eh_regular):
+        max_t = SECTION_RETRIES if eh_regular else 1
+        orgaos = {}
+
+        for t in range(1, max_t + 1):
+            if eh_regular and t == max_t:
+                logger.info(f"  → Tentativa final: forçando fallback (busca paginada)...")
+                orgaos = self._fetch_via_busca(secao_id, data)
+            else:
+                orgaos = self._buscar_secao(secao_id, data, eh_regular)
+
+            if orgaos:
+                if t > 1:
+                    logger.info(f"  ✓ {nome_secao}: sucesso na tentativa {t}")
+                return orgaos
+
+            if eh_regular and t < max_t:
+                delay = SECTION_RETRY_DELAY * t
+                logger.warning(f"  ⚠ {nome_secao} vazio (tentativa {t}/{max_t}) — aguardando {delay:.0f}s...")
+                time.sleep(delay)
+
+        return orgaos
+
+    def _log_completude(self, resultado):
+        secoes_presentes = set(resultado.get("secoes", {}).keys())
+        for nome_secao in config.SECOES_REGULARES.values():
+            if nome_secao not in secoes_presentes:
+                logger.warning(f"⚠ COMPLETUDE: {nome_secao} ausente no resultado final!")
+
+        total = resultado.get("total_publicacoes", 0)
+        if total == 0:
+            logger.warning("⚠ COMPLETUDE: ZERO publicações. Verifique a API.")
+        elif total < 10:
+            logger.warning(f"⚠ COMPLETUDE: Apenas {total} publicações — volume suspeito.")
 
     # ─── BUSCA POR SEÇÃO ──────────────────────────────────
 
-    def _buscar_secao(self, secao_id: str, data: date) -> dict:
-        """
-        Busca TODAS as publicações de uma seção/data.
-
-        1ª tentativa: /leiturajornal (JSON completo)
-        2ª tentativa: /consulta/-/buscar/dou (busca paginada)
-
-        Retorna: { "Nome Órgão": [lista de pubs] } (filtrado)
-        """
-        # Tentativa 1: /leiturajornal
+    def _buscar_secao(self, secao_id, data, eh_regular=False):
         items = self._fetch_via_leiturajornal(secao_id, data)
 
         if items is None:
-            # Tentativa 2: busca paginada por órgão
             logger.info(f"    Fallback: usando endpoint de busca...")
             return self._fetch_via_busca(secao_id, data)
+
+        # ── CAMADA 2: VALIDAÇÃO DE CONTAGEM PRÉ-FILTRO ──
+        # Se é seção regular, o total bruto deve ser > 0 em dia útil.
+        # Total 0 em dia útil = bug da API, forçar retry (retornar {} vazio).
+        if not items and eh_regular:
+            logger.warning(f"    Camada 2: jsonArray vazio em seção regular — provável bug da API")
+            return {}
 
         if not items:
             return {}
 
-        # Filtrar por órgãos de interesse
+        total_bruto = len(items)
+        logger.info(f"    Total bruto (todos os órgãos): {total_bruto} publicações")
+
         return self._filtrar_por_orgaos(items)
 
     # ─── ESTRATÉGIA 1: /leiturajornal ─────────────────────
 
-    def _fetch_via_leiturajornal(
-        self, secao_id: str, data: date
-    ) -> Optional[list]:
-        """
-        Acessa /leiturajornal?secao=dou1&data=DD-MM-YYYY
-        Extrai o JSON de <script id="params"> → jsonArray
-        Retorna lista de items (sem filtro) ou None se falhar.
-        """
+    def _fetch_via_leiturajornal(self, secao_id, data):
         data_str = data.strftime("%d-%m-%Y")
         url = f"{config.DOU_LEITURA_URL}?secao={secao_id}&data={data_str}"
 
@@ -173,17 +190,17 @@ class DOUFetcher:
                 resp = self.session.get(url, timeout=config.REQUEST_TIMEOUT)
                 resp.raise_for_status()
 
-                # Extrair JSON do <script id="params">
                 items = self._parse_leiturajornal(resp.text)
                 if items is not None:
                     return items
 
-                # Se não encontrou o script, pode ser seção inexistente (extra)
-                # Verificar se a página tem indicação de "sem conteúdo"
                 if "nenhum resultado" in resp.text.lower() or len(resp.text) < 2000:
                     return []
 
                 logger.warning(f"    Não encontrou jsonArray na resposta")
+                if tentativa < config.MAX_RETRIES:
+                    time.sleep(config.REQUEST_DELAY * tentativa)
+                    continue
                 return None
 
             except requests.RequestException as e:
@@ -193,38 +210,26 @@ class DOUFetcher:
 
         return None
 
-    def _parse_leiturajornal(self, html: str) -> Optional[list]:
-        """
-        Extrai items do JSON embutido em <script id="params">.
-
-        O campo jsonArray pode vir como:
-          - string JSON escapada: "[{...}, {...}]"  → precisa json.loads()
-          - lista Python já parseada: [{...}, {...}] → usar direto
-        """
+    def _parse_leiturajornal(self, html):
         soup = BeautifulSoup(html, "html.parser")
 
-        # Estratégia 1: <script id="params">
         script = soup.find("script", {"id": "params"})
         if script and script.string:
             try:
                 data = json.loads(script.string)
                 json_array = data.get("jsonArray", [])
-
-                # jsonArray pode ser string OU lista
                 if isinstance(json_array, list):
                     items = json_array
                 elif isinstance(json_array, str):
                     items = json.loads(json_array)
                 else:
                     items = []
-
                 if isinstance(items, list):
                     logger.debug(f"    jsonArray: {len(items)} itens totais")
                     return items
             except (json.JSONDecodeError, TypeError, ValueError) as e:
                 logger.warning(f"    Erro ao parsear script#params: {e}")
 
-        # Estratégia 2: qualquer <script type="application/json">
         for tag in soup.find_all("script", {"type": "application/json"}):
             if not tag.string:
                 continue
@@ -243,20 +248,10 @@ class DOUFetcher:
             except (json.JSONDecodeError, TypeError, ValueError):
                 continue
 
-        # Estratégia 3: regex brute-force
-        match = re.search(
-            r'"jsonArray"\s*:\s*"(\[.*?\])"\s*[,}]',
-            html,
-            re.DOTALL,
-        )
+        match = re.search(r'"jsonArray"\s*:\s*"(\[.*?\])"\s*[,}]', html, re.DOTALL)
         if match:
             try:
-                raw = (
-                    match.group(1)
-                    .replace('\\"', '"')
-                    .replace("\\/", "/")
-                    .replace("\\n", " ")
-                )
+                raw = match.group(1).replace('\\"', '"').replace("\\/", "/").replace("\\n", " ")
                 items = json.loads(raw)
                 if isinstance(items, list):
                     return items
@@ -265,14 +260,9 @@ class DOUFetcher:
 
         return None
 
-    # ─── ESTRATÉGIA 2: /consulta/-/buscar/dou (FALLBACK) ──
+    # ─── ESTRATÉGIA 2: /consulta/-/buscar/dou ──────────────
 
-    def _fetch_via_busca(self, secao_id: str, data: date) -> dict:
-        """
-        Busca paginada por órgão no endpoint de busca.
-        secao_id no formato "dou1" precisa virar "do1" para a busca.
-        """
-        # Converter: dou1 → do1, dou2 → do2, dou1a → do1a
+    def _fetch_via_busca(self, secao_id, data):
         busca_secao = secao_id.replace("dou", "do")
         data_str = data.strftime("%d-%m-%Y")
         orgaos_resultado = {}
@@ -284,10 +274,7 @@ class DOUFetcher:
 
         return orgaos_resultado
 
-    def _busca_paginada(
-        self, secao: str, data_str: str, orgao: str
-    ) -> list:
-        """Busca paginada de todas as publicações de um órgão."""
+    def _busca_paginada(self, secao, data_str, orgao):
         todas = []
         start = 0
 
@@ -301,11 +288,7 @@ class DOUFetcher:
                     "delta": config.MAX_RESULTS_PER_PAGE,
                     "start": start,
                 }
-                resp = self.session.get(
-                    config.DOU_BUSCA_URL,
-                    params=params,
-                    timeout=config.REQUEST_TIMEOUT,
-                )
+                resp = self.session.get(config.DOU_BUSCA_URL, params=params, timeout=config.REQUEST_TIMEOUT)
                 resp.raise_for_status()
 
                 items, total = self._parse_busca_html(resp.text)
@@ -329,8 +312,7 @@ class DOUFetcher:
 
         return todas
 
-    def _parse_busca_html(self, html: str) -> tuple:
-        """Extrai items do HTML de busca. Retorna (items, total)."""
+    def _parse_busca_html(self, html):
         soup = BeautifulSoup(html, "html.parser")
 
         for tag in soup.find_all("script", {"type": "application/json"}):
@@ -355,37 +337,18 @@ class DOUFetcher:
 
     # ─── FILTRO E NORMALIZAÇÃO ────────────────────────────
 
-    def _filtrar_por_orgaos(self, items: list) -> dict:
-        """
-        Recebe lista bruta de items do JSON e filtra pelos órgãos.
-
-        Campos relevantes do JSON:
-          - artCategory: órgão principal (ex: "Ministério da Fazenda")
-          - hierarchyStr: hierarquia completa
-          - urlTitle: slug para montar URL
-          - title: título
-          - content / abstract: ementa
-          - artType / pubName: tipo do ato
-          - numberPage: nº da página
-          - editionNumber: nº da edição
-          - pubDate: data de publicação
-          - hierarchyList: lista de níveis hierárquicos
-        """
+    def _filtrar_por_orgaos(self, items):
         orgaos_filtro_lower = {o.lower(): o for o in config.ORGAOS_FILTRO}
         resultado = {}
 
         for item in items:
-            # O campo "artCategory" contém o órgão principal
             art_category = (item.get("artCategory") or "").strip()
-
-            # Verificar se o órgão está na lista de filtro
             orgao_match = None
             cat_lower = art_category.lower()
 
             if cat_lower in orgaos_filtro_lower:
                 orgao_match = orgaos_filtro_lower[cat_lower]
             else:
-                # Fallback: verificar hierarchyStr
                 hierarchy = (item.get("hierarchyStr") or "").strip()
                 for filtro_lower, filtro_original in orgaos_filtro_lower.items():
                     if filtro_lower in hierarchy.lower():
@@ -401,8 +364,7 @@ class DOUFetcher:
 
         return resultado
 
-    def _normalizar_item(self, item: dict) -> Optional[dict]:
-        """Normaliza um item JSON para formato padronizado."""
+    def _normalizar_item(self, item):
         try:
             url_title = (item.get("urlTitle") or "").strip()
             if not url_title:
@@ -410,7 +372,6 @@ class DOUFetcher:
 
             url = f"{config.DOU_ARTICLE_BASE}{url_title}"
 
-            # Montar sub-órgão a partir de hierarchyList ou hierarchyStr
             hierarchy_list = item.get("hierarchyList") or []
             sub_orgao = ""
             if isinstance(hierarchy_list, list) and len(hierarchy_list) > 1:
@@ -420,17 +381,12 @@ class DOUFetcher:
                 if len(parts) > 1:
                     sub_orgao = parts[-1].strip()
 
-            # Ementa: tentar "content" primeiro, depois "abstract"
             ementa = (item.get("content") or item.get("abstract") or "").strip()
 
             return {
                 "titulo": (item.get("title") or "Sem título").strip(),
                 "ementa": ementa,
-                "tipo_ato": (
-                    item.get("artType")
-                    or item.get("pubName")
-                    or ""
-                ).strip(),
+                "tipo_ato": (item.get("artType") or item.get("pubName") or "").strip(),
                 "orgao": (item.get("artCategory") or "").strip(),
                 "sub_orgao": sub_orgao,
                 "url": url,
