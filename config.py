@@ -23,7 +23,7 @@ UNSUBSCRIBE_EMAIL = SMTP_USER
 # ═══════════════════════════════════════════════════════════
 GITHUB_PAGES_URL = os.environ.get(
     "PAGES_URL",
-    "https://naytributario.github.io/Boletim-tributario/"
+    "https://automacoestec.github.io/Boletim-tributario/"
 )
 
 # ═══════════════════════════════════════════════════════════
