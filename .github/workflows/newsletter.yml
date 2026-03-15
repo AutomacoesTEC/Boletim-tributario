@@ -43,7 +43,8 @@ jobs:
       - name: 📦 Instalar dependências
         run: pip install -r requirements.txt
 
-      - name: 📋 Executar Boletim DOU
+      - name: 📋 Executar Boletim DOU (1ª tentativa)
+        id: primeira_tentativa
         env:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
@@ -56,9 +57,51 @@ jobs:
           if [ -n "${{ github.event.inputs.test_email }}" ]; then
             ARGS="$ARGS --test ${{ github.event.inputs.test_email }}"
           fi
+
+          set +e
           python main.py $ARGS
+          EXIT_CODE=$?
+          set -e
+
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+          if [ $EXIT_CODE -eq 2 ]; then
+            echo "⚠ Resultado incompleto — Camada 3: reexecução em 30 minutos"
+          elif [ $EXIT_CODE -ne 0 ]; then
+            echo "✗ Erro na execução (code $EXIT_CODE)"
+            exit $EXIT_CODE
+          else
+            echo "✓ Execução concluída com sucesso"
+          fi
+
+      # ═══ CAMADA 3: REEXECUÇÃO APÓS 30 MINUTOS ═══
+      - name: ⏳ Aguardar 30 minutos (Camada 3)
+        if: steps.primeira_tentativa.outputs.exit_code == '2'
+        run: |
+          echo "Aguardando 30 minutos para a API estabilizar..."
+          sleep 1800
+          echo "✓ Espera concluída. Reexecutando..."
+
+      - name: 🔄 Reexecutar Boletim DOU (2ª tentativa)
+        if: steps.primeira_tentativa.outputs.exit_code == '2'
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          TZ: America/Sao_Paulo
+        run: |
+          ARGS="--retry"
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+            ARGS="$ARGS --force"
+          fi
+          if [ -n "${{ github.event.inputs.test_email }}" ]; then
+            ARGS="$ARGS --test ${{ github.event.inputs.test_email }}"
+          fi
+
+          python main.py $ARGS
+          echo "✓ Reexecução concluída"
 
       - name: 🌐 Publicar página web
+        if: always()
         run: |
           if [ -f "docs/index.html" ]; then
             git config user.name "Boletim DOU Bot"
