@@ -1,0 +1,51 @@
+name: Keepalive — Manter cron ativo
+
+on:
+  schedule:
+    - cron: '0 12 1 * *'
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Keepalive commit
+        run: |
+          git config user.name "Keepalive Bot"
+          git config user.email "bot@keepalive.local"
+          git commit --allow-empty -m "chore: keepalive — $(date +%B/%Y)"
+          git push
+          echo "✓ Repositório mantido ativo"
+
+      - name: Notificar por e-mail
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_EMAIL: tectributos.federal11@gmail.com
+        run: |
+          python3 -c "
+          import smtplib, os, datetime
+          from email.mime.text import MIMEText
+          user = os.environ.get('GMAIL_USER', '')
+          pwd = os.environ.get('GMAIL_APP_PASSWORD', '')
+          dest = os.environ.get('ALERT_EMAIL', '')
+          if not user or not pwd:
+              print('Credenciais ausentes'); exit(0)
+          now = datetime.datetime.now().strftime('%d/%m/%Y %H:%M')
+          body = f'Keepalive do Boletim DOU rodou em {now} UTC.\nCron do boletim diario continua ativo.\nNenhuma acao necessaria.'
+          msg = MIMEText(body, 'plain', 'utf-8')
+          msg['From'] = user
+          msg['To'] = dest
+          msg['Subject'] = f'Keepalive Boletim DOU — {now}'
+          try:
+              with smtplib.SMTP('smtp.gmail.com', 587, timeout=15) as s:
+                  s.starttls(); s.login(user, pwd)
+                  s.sendmail(user, dest, msg.as_string())
+              print('Notificacao enviada para ' + dest)
+          except Exception as e:
+              print(f'Falha (nao critico): {e}')
+          "
