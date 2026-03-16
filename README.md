@@ -98,3 +98,4 @@ Edite `config.py` para alterar órgãos monitorados (`ORGAOS_FILTRO`), seções 
 ## Licença
 
 Uso livre. Os dados do DOU são públicos (Lei 12.527/2011).
+
