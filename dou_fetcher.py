@@ -1,14 +1,15 @@
 """
 dou_fetcher.py — Coleta de publicações do Diário Oficial da União
 
-ESTRATÉGIA DUPLA:
-  1ª: /leiturajornal (JSON completo da seção) → filtra localmente
-  2ª: /consulta/-/buscar/dou (busca paginada por órgão) → fallback
+ESTRATÉGIA TRIPLA (seções regulares):
+  1ª: /leiturajornal?org=X — busca por órgão, como o site oficial faz.
+      Garante completude: a API sem filtro de órgão trunca o jsonArray.
+  2ª: /leiturajornal (JSON completo da seção) → filtra localmente (fallback)
+  3ª: /consulta/-/buscar/dou (busca paginada por órgão) → fallback final
 
 CAMADA 1 — RETRY AGRESSIVO:
   Cada seção regular é tentada até SECTION_RETRIES vezes.
-  Se /leiturajornal falha, cai para busca paginada.
-  Na última tentativa, força o fallback direto.
+  Na última tentativa, força o fallback direto (busca paginada).
 
 CAMADA 2 — VALIDAÇÃO DE CONTAGEM:
   O jsonArray retorna TODAS as publicações (não só dos nossos 6 órgãos).
@@ -83,28 +84,20 @@ class DOUFetcher:
         }
 
         # Edições regulares (Seção 1, 2, 3 — data de HOJE)
-        # Só busca seções regulares se a data for dia útil.
-        # Em fins de semana e feriados, o DOU não publica — ausência é esperada.
-        if eh_dia_util(data_regular):
-            for secao_id, nome_secao in config.SECOES_REGULARES.items():
-                logger.info(f"▶ {nome_secao} — {data_regular.strftime('%d/%m/%Y')}")
-                orgaos = self._buscar_secao_com_retry(
-                    secao_id, data_regular, nome_secao, eh_regular=True
-                )
-                if orgaos:
-                    resultado["secoes"][nome_secao] = orgaos
-                    n = sum(len(v) for v in orgaos.values())
-                    resultado["total_publicacoes"] += n
-                    logger.info(f"  ✓ {n} publicação(ões) relevante(s)")
-                else:
-                    logger.warning(f"  ⚠ {nome_secao} retornou VAZIO após todas as tentativas")
-                    resultado["completo"] = False
-                    resultado["secoes_faltantes"].append(nome_secao)
-        else:
-            logger.info(
-                f"  {data_regular.strftime('%d/%m/%Y')} não é dia útil — "
-                "seções regulares ignoradas (fim de semana ou feriado)"
+        for secao_id, nome_secao in config.SECOES_REGULARES.items():
+            logger.info(f"▶ {nome_secao} — {data_regular.strftime('%d/%m/%Y')}")
+            orgaos = self._buscar_secao_com_retry(
+                secao_id, data_regular, nome_secao, eh_regular=True
             )
+            if orgaos:
+                resultado["secoes"][nome_secao] = orgaos
+                n = sum(len(v) for v in orgaos.values())
+                resultado["total_publicacoes"] += n
+                logger.info(f"  ✓ {n} publicação(ões) relevante(s)")
+            else:
+                logger.warning(f"  ⚠ {nome_secao} retornou VAZIO após todas as tentativas")
+                resultado["completo"] = False
+                resultado["secoes_faltantes"].append(nome_secao)
 
         # Edições extras (data do DIA ÚTIL ANTERIOR)
         if data_extra:
@@ -165,6 +158,17 @@ class DOUFetcher:
     # ─── BUSCA POR SEÇÃO ──────────────────────────────────
 
     def _buscar_secao(self, secao_id, data, eh_regular=False):
+        # ── ESTRATÉGIA 1: busca por órgão (como o site oficial faz) ──
+        # Só para seções regulares — extras são raras e não precisam disso.
+        if eh_regular:
+            orgaos = self._fetch_por_orgao(secao_id, data)
+            if orgaos:
+                total = sum(len(v) for v in orgaos.values())
+                logger.info(f"    Estratégia por órgão: {total} pub(s) de {len(orgaos)} órgão(s)")
+                return orgaos
+            logger.info(f"    Busca por órgão insuficiente — tentando busca geral...")
+
+        # ── ESTRATÉGIA 2: busca geral + filtro local (fallback) ──
         items = self._fetch_via_leiturajornal(secao_id, data)
 
         if items is None:
@@ -172,8 +176,6 @@ class DOUFetcher:
             return self._fetch_via_busca(secao_id, data)
 
         # ── CAMADA 2: VALIDAÇÃO DE CONTAGEM PRÉ-FILTRO ──
-        # Se é seção regular, o total bruto deve ser > 0 em dia útil.
-        # Total 0 em dia útil = bug da API, forçar retry (retornar {} vazio).
         if not items and eh_regular:
             logger.warning(f"    Camada 2: jsonArray vazio em seção regular — provável bug da API")
             return {}
@@ -186,7 +188,77 @@ class DOUFetcher:
 
         return self._filtrar_por_orgaos(items)
 
-    # ─── ESTRATÉGIA 1: /leiturajornal ─────────────────────
+    # ─── ESTRATÉGIA 1A: /leiturajornal por órgão ─────────
+
+    def _fetch_por_orgao(self, secao_id, data):
+        """
+        Busca publicações órgão a órgão via /leiturajornal?org=X.
+        Replica a mesma estratégia que o site oficial do DOU usa.
+        Retorna dict {orgao: [pubs]} ou {} se falhar.
+        """
+        data_str = data.strftime("%d-%m-%Y")
+        orgaos_resultado = {}
+        urls_vistas = set()
+        falhas_consecutivas = 0
+
+        for orgao in config.ORGAOS_FILTRO:
+            items = self._fetch_leiturajornal_org(secao_id, data_str, orgao)
+
+            # Se formato dou1 não funcionou, tenta do1
+            if items is None:
+                secao_alt = secao_id.replace("dou", "do")
+                items = self._fetch_leiturajornal_org(secao_alt, data_str, orgao)
+
+            if items is None:
+                falhas_consecutivas += 1
+                # 3 falhas seguidas = API com problema, aborta estratégia
+                if falhas_consecutivas >= 3:
+                    logger.warning(f"    3 falhas consecutivas na busca por órgão — abortando")
+                    return {}
+                continue
+
+            falhas_consecutivas = 0
+
+            pubs = []
+            for item in items:
+                pub = self._normalizar_item(item)
+                if pub and pub["url"] not in urls_vistas:
+                    urls_vistas.add(pub["url"])
+                    pubs.append(pub)
+
+            if pubs:
+                orgaos_resultado[orgao] = pubs
+                logger.info(f"    {orgao}: {len(pubs)} publicação(ões)")
+
+            time.sleep(0.3)
+
+        return orgaos_resultado
+
+    def _fetch_leiturajornal_org(self, secao_id, data_str, orgao):
+        """
+        GET /leiturajornal?secao=X&data=Y&org=Z
+        Retorna lista de itens ou None em caso de erro.
+        """
+        try:
+            params = {
+                "secao": secao_id,
+                "data": data_str,
+                "org": orgao,
+            }
+            resp = self.session.get(
+                config.DOU_LEITURA_URL,
+                params=params,
+                timeout=config.REQUEST_TIMEOUT,
+            )
+            resp.raise_for_status()
+            items = self._parse_leiturajornal(resp.text)
+            # items pode ser [] (vazio legítimo) ou None (parse falhou)
+            return items
+        except requests.RequestException as e:
+            logger.debug(f"    GET /leiturajornal?org={orgao} falhou: {e}")
+            return None
+
+    # ─── ESTRATÉGIA 1B: /leiturajornal geral ─────────────
 
     def _fetch_via_leiturajornal(self, secao_id, data):
         data_str = data.strftime("%d-%m-%Y")
